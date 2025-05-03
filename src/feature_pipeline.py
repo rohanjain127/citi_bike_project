@@ -21,7 +21,8 @@ logger = logging.getLogger(__name__)
 
 
 # Step 1: Get the current date and time (timezone-aware)
-current_date = pd.to_datetime(datetime.now(timezone.utc)).ceil("h")
+#current_date = pd.to_datetime(datetime.now(timezone.utc)).ceil("h")
+current_date = pd.Timestamp("2025-04-01 00:00:00", tz="UTC")
 logger.info(f"Current date and time (UTC): {current_date}")
 
 # Step 2: Define the data fetching range

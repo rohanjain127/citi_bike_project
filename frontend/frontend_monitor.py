@@ -50,4 +50,4 @@ fig = px.line(
 
 # Display the plot
 st.plotly_chart(fig)
-st.write(f'Average MAE: {mae_by_hour["MAE"].mean()}')
+st.write(f'Average MAE: {mae_by_hour["MAE"].mean():.2f}')
