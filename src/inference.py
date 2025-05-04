@@ -15,11 +15,7 @@ import hopsworks
 from hsfs.feature import Feature
 
 import src.config as config
-from src.inference import (
-    get_feature_store,
-    load_model_from_registry,
-    get_model_predictions,
-)
+
 from src.data_utils import transform_ts_data_info_features
 
 # ────────────────────────────────────────────────────────────────────────────────
