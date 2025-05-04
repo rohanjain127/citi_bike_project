@@ -1,56 +1,31 @@
-# name: model_training_pipeline
-
-# on:
-#   schedule:
-#     - cron: '0 0 * * 1' # Runs every monday
-#   workflow_dispatch: # Allows manual triggering of the workflow
-
-# jobs:
-#   run-python-script:
-#     runs-on: ubuntu-latest
-
-#     steps:
-#       - name: Checkout repository
-#         uses: actions/checkout@v4
-
-#       - name: Set up Python
-#         uses: actions/setup-python@v5
-#         with:
-#           python-version: '3.11' # Specify the Python version
-
-#       - name: Install dependencies
-#         run: |
-#           python -m pip install --upgrade pip
-#           pip install -r requirements.txt # Install dependencies if a requirements file exists
-
-#       - name: Train model on new data
-#         env:
-#           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY}}
-#         run: python -m pipelines.model_training_pipeline
-
 name: 🔧 Model Training
 
 on:
   schedule:
-    - cron: '0 0 * * 1'   # every Monday at midnight
-  workflow_dispatch:
+    - cron: '0 0 * * 1'   # every Monday at midnight UTC
+  workflow_dispatch:     # allows manual triggering
 
 jobs:
   train:
     runs-on: ubuntu-latest
+
     env:
-      HOPSWORKS_API_KEY:     ${{ secrets.HOPSWORKS_API_KEY }}
+      HOPSWORKS_API_KEY:      ${{ secrets.HOPSWORKS_API_KEY }}
       HOPSWORKS_PROJECT_NAME: ${{ secrets.HOPSWORKS_PROJECT_NAME }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with: python-version: '3.10'
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-      - name: Install dependencies
+      - name: 📦 Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run training pipeline
+      - name: 🚂 Run training pipeline
         run: python -m pipelines.model_training_pipeline
