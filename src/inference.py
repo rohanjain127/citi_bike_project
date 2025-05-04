@@ -1,147 +1,142 @@
-from datetime import datetime, timedelta, timezone
+#!/usr/bin/env python3
+"""
+Inference pipeline:
+▪ Read latest hour from your historical rides Feature Group
+▪ Slide a 28-day window, build features, run your sklearn+LightGBM pipeline
+▪ Write next-hour predictions to your prediction Feature Group
+"""
 
-import hopsworks
-import numpy as np
+import logging
+import sys
+from datetime import timedelta
+
 import pandas as pd
-from hsfs.feature_store import FeatureStore
+import hopsworks
+from hsfs.feature import Feature
 
 import src.config as config
+from src.inference import (
+    get_feature_store,
+    load_model_from_registry,
+    get_model_predictions,
+)
 from src.data_utils import transform_ts_data_info_features
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Logging
+# ────────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(message)s",
+)
+logger = logging.getLogger(__name__)
 
-def get_hopsworks_project() -> hopsworks.project.Project:
-    return hopsworks.login(
-        project=config.HOPSWORKS_PROJECT_NAME, api_key_value=config.HOPSWORKS_API_KEY
+def main():
+    # ────────────────────────────────────────────────────────────────────────────
+    # 1️⃣ Connect to Hopsworks and get your feature store
+    # ────────────────────────────────────────────────────────────────────────────
+    project = hopsworks.login(
+        project       = config.HOPSWORKS_PROJECT_NAME,
+        api_key_value = config.HOPSWORKS_API_KEY,
+    )
+    fs = project.get_feature_store()
+
+    # ────────────────────────────────────────────────────────────────────────────
+    # 2️⃣ Read your historical hourly FG and find the latest hour
+    # ────────────────────────────────────────────────────────────────────────────
+    hourly_fg = fs.get_feature_group(
+        name    = config.FEATURE_GROUP_NAME,
+        version = config.FEATURE_GROUP_VERSION,
+    )
+    hist = hourly_fg.read()
+    latest_hr = pd.to_datetime(hist["pickup_hour"].max(), utc=True)
+    logger.info("Latest historical hour: %s", latest_hr)
+
+    # ────────────────────────────────────────────────────────────────────────────
+    # 3️⃣ Define your 28-day sliding window
+    # ────────────────────────────────────────────────────────────────────────────
+    window_size = 24 * 28  # hours
+    fetch_from  = latest_hr - timedelta(hours=window_size + 1)
+    fetch_to    = latest_hr
+    logger.info("Building features from %s → %s", fetch_from, fetch_to)
+
+    # ────────────────────────────────────────────────────────────────────────────
+    # 4️⃣ Pull exactly that slice from your Feature View
+    # ────────────────────────────────────────────────────────────────────────────
+    fv = fs.get_feature_view(
+        name    = config.FEATURE_VIEW_NAME,
+        version = config.FEATURE_VIEW_VERSION,
+    )
+    ts_data = (
+        fv.get_batch_data(start_time=fetch_from, end_time=fetch_to)
+          .loc[lambda df: df.pickup_hour.between(fetch_from, fetch_to)]
+          .sort_values(["pickup_location_id", "pickup_hour"])
     )
 
+    if ts_data.empty:
+        logger.warning("No time-series data in that window → exiting cleanly")
+        sys.exit(0)
 
-def get_feature_store() -> FeatureStore:
-    project = get_hopsworks_project()
-    return project.get_feature_store()
-
-
-def get_model_predictions(model, features: pd.DataFrame) -> pd.DataFrame:
-    # past_rides_columns = [c for c in features.columns if c.startswith('rides_')]
-    predictions = model.predict(features)
-
-    results = pd.DataFrame()
-    results["pickup_location_id"] = features["pickup_location_id"].values
-    results["predicted_demand"] = predictions.round(0)
-
-    return results
-
-
-def load_batch_of_features_from_store(
-    current_date: datetime,
-) -> pd.DataFrame:
-    feature_store = get_feature_store()
-
-    # read time-series data from the feature store
-    fetch_data_to = current_date - timedelta(hours=1)
-    fetch_data_from = current_date - timedelta(days=29)
-    print(f"Fetching data from {fetch_data_from} to {fetch_data_to}")
-    feature_view = feature_store.get_feature_view(
-        name=config.FEATURE_VIEW_NAME, version=config.FEATURE_VIEW_VERSION
-    )
-
-    ts_data = feature_view.get_batch_data(
-        start_time=(fetch_data_from - timedelta(days=1)),
-        end_time=(fetch_data_to + timedelta(days=1)),
-    )
-    ts_data = ts_data[ts_data.pickup_hour.between(fetch_data_from, fetch_data_to)]
-
-    # Sort data by location and time
-    ts_data.sort_values(by=["pickup_location_id", "pickup_hour"], inplace=True)
-
+    # ────────────────────────────────────────────────────────────────────────────
+    # 5️⃣ Turn it into sliding-window features
+    # ────────────────────────────────────────────────────────────────────────────
     features = transform_ts_data_info_features(
-        ts_data, window_size=24 * 28, step_size=23
+        ts_data,
+        feature_col = "rides",
+        window_size = window_size,
+        step_size   = 1,
     )
 
-    return features
+    if features.empty:
+        logger.warning("Not enough history to build even one window → exiting cleanly")
+        sys.exit(0)
 
+    # ────────────────────────────────────────────────────────────────────────────
+    # 6️⃣ Insert dummy target so your pipeline sees exactly the 676 inputs
+    # ────────────────────────────────────────────────────────────────────────────
+    features["target"] = 0
 
-def load_model_from_registry(version=None):
-    from pathlib import Path
+    # ────────────────────────────────────────────────────────────────────────────
+    # 7️⃣ Load your full sklearn Pipeline (featurizer + LGBM) from model registry
+    # ────────────────────────────────────────────────────────────────────────────
+    model = load_model_from_registry()
 
-    import joblib
+    # ────────────────────────────────────────────────────────────────────────────
+    # 8️⃣ Run prediction
+    # ────────────────────────────────────────────────────────────────────────────
+    preds = get_model_predictions(model, features)
+    # rename to match FG schema
+    preds = preds.rename(columns={"predicted_demand": "predicted_rides"})
 
-    from src.pipeline_utils import (  # Import custom classes/functions
-        TemporalFeatureEngineer,
-        average_rides_last_4_weeks,
+    # ────────────────────────────────────────────────────────────────────────────
+    # 9️⃣ Stamp on the next-hour timestamp
+    # ────────────────────────────────────────────────────────────────────────────
+    preds["pickup_hour"] = latest_hr + timedelta(hours=1)
+
+    # ────────────────────────────────────────────────────────────────────────────
+    # 🔟 Write back to your prediction FG v2
+    # ────────────────────────────────────────────────────────────────────────────
+    pred_fg = fs.get_or_create_feature_group(
+        name         = config.FEATURE_GROUP_MODEL_PREDICTION,
+        version      = config.FEATURE_GROUP_MODEL_PREDICTION_VERSION,
+        description  = "Next-hour demand predictions from LGBM model",
+        primary_key  = ["pickup_location_id", "pickup_hour"],
+        event_time   = "pickup_hour",
+        online_enabled=False,
+        features     = [
+            Feature("pickup_location_id", "string"),
+            Feature("pickup_hour",        "timestamp"),
+            Feature("predicted_rides",    "int"),
+        ],
     )
 
-    project = get_hopsworks_project()
-    model_registry = project.get_model_registry()
+    # ensure correct types
+    preds["pickup_location_id"] = preds["pickup_location_id"].astype(str)
+    preds["predicted_rides"]    = preds["predicted_rides"].astype("int32")
 
-    models = model_registry.get_models(name=config.MODEL_NAME)
-    model = max(models, key=lambda model: model.version)
-    model_dir = model.download()
-    model = joblib.load(Path(model_dir) / "lgb_model.pkl")
+    logger.info("Inserting %d prediction rows …", len(preds))
+    pred_fg.insert(preds, write_options={"wait_for_job": False})
+    logger.info("✅ Inference complete — predictions up to %s", preds["pickup_hour"].iloc[0])
 
-    return model
-
-
-def load_metrics_from_registry(version=None):
-
-    project = get_hopsworks_project()
-    model_registry = project.get_model_registry()
-
-    models = model_registry.get_models(name=config.MODEL_NAME)
-    model = max(models, key=lambda model: model.version)
-
-    return model.training_metrics
-
-
-def fetch_next_hour_predictions():
-    # Get current UTC time and round up to next hour
-    now = datetime.now(timezone.utc)
-    next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-
-    fs = get_feature_store()
-    fg = fs.get_feature_group(name=config.FEATURE_GROUP_MODEL_PREDICTION, version=1)
-    df = fg.read()
-    # Then filter for next hour in the DataFrame
-    df = df[df["pickup_hour"] == next_hour]
-
-    print(f"Current UTC time: {now}")
-    print(f"Next hour: {next_hour}")
-    print(f"Found {len(df)} records")
-    return df
-
-
-def fetch_predictions(hours):
-    current_hour = (pd.Timestamp.now(tz="Etc/UTC") - timedelta(hours=hours)).floor("h")
-
-    fs = get_feature_store()
-    fg = fs.get_feature_group(name=config.FEATURE_GROUP_MODEL_PREDICTION, version=1)
-
-    df = fg.filter((fg.pickup_hour >= current_hour)).read()
-
-    return df
-
-
-def fetch_hourly_rides(hours):
-    current_hour = (pd.Timestamp.now(tz="Etc/UTC") - timedelta(hours=hours)).floor("h")
-
-    fs = get_feature_store()
-    fg = fs.get_feature_group(name=config.FEATURE_GROUP_NAME, version=1)
-
-    query = fg.select_all()
-    query = query.filter(fg.pickup_hour >= current_hour)
-
-    return query.read()
-
-
-def fetch_days_data(days):
-    current_date = pd.Timestamp("2025-04-01 00:00:00", tz="UTC")
-    fetch_data_from = current_date - timedelta(days=(365 + days))
-    fetch_data_to = current_date - timedelta(days=365)
-    print(fetch_data_from, fetch_data_to)
-    fs = get_feature_store()
-    fg = fs.get_feature_group(name=config.FEATURE_GROUP_NAME, version=1)
-
-    query = fg.select_all()
-    # query = query.filter((fg.pickup_hour >= fetch_data_from))
-    df = query.read()
-    cond = (df["pickup_hour"] >= fetch_data_from) & (df["pickup_hour"] <= fetch_data_to)
-    return df[cond]
+if __name__ == "__main__":
+    main()
