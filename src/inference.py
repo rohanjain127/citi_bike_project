@@ -1,138 +1,124 @@
 #!/usr/bin/env python3
 """
-Inference pipeline:
-▪ Read latest hour from your historical rides Feature Group
-▪ Slide a 28-day window, build features, run your sklearn+LightGBM pipeline
-▪ Write next-hour predictions to your prediction Feature Group
+src/inference.py
+
+Helper methods to:
+  • connect to Hopsworks and fetch the Feature Store
+  • load the latest LightGBM pipeline from the model registry
+  • turn a trained pipeline into predictions DataFrame
 """
 
-import logging
-import sys
-from datetime import timedelta
-
-import pandas as pd
 import hopsworks
-from hsfs.feature import Feature
+import joblib
+import os
+import pandas as pd
+from pathlib import Path
+from hsfs.feature_store import FeatureStore
 
 import src.config as config
-
 from src.data_utils import transform_ts_data_info_features
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Logging
-# ────────────────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)s  %(message)s",
-)
-logger = logging.getLogger(__name__)
 
-def main():
-    # ────────────────────────────────────────────────────────────────────────────
-    # 1️⃣ Connect to Hopsworks and get your feature store
-    # ────────────────────────────────────────────────────────────────────────────
-    project = hopsworks.login(
+def get_hopsworks_project() -> hopsworks.project.Project:
+    """Log in to Hopsworks and return the project handle."""
+    return hopsworks.login(
         project       = config.HOPSWORKS_PROJECT_NAME,
         api_key_value = config.HOPSWORKS_API_KEY,
     )
-    fs = project.get_feature_store()
 
-    # ────────────────────────────────────────────────────────────────────────────
-    # 2️⃣ Read your historical hourly FG and find the latest hour
-    # ────────────────────────────────────────────────────────────────────────────
-    hourly_fg = fs.get_feature_group(
-        name    = config.FEATURE_GROUP_NAME,
-        version = config.FEATURE_GROUP_VERSION,
-    )
-    hist = hourly_fg.read()
+
+def get_feature_store() -> FeatureStore:
+    """Grab the Feature Store client from your Hopsworks project."""
+    project = get_hopsworks_project()
+    return project.get_feature_store()
+
+
+def load_model_from_registry(model_name: str = None, version: int = None):
+    """
+    Download & load the latest sklearn Pipeline you registered in Hopsworks.
+    Returns a joblib-loaded pipeline object.
+    """
+    project        = get_hopsworks_project()
+    registry       = project.get_model_registry()
+    models         = registry.get_models(name = model_name or config.MODEL_NAME)
+    best           = max(models, key=lambda m: m.version if version is None else (m.version == version))
+    download_dir   = best.download()
+    artifact_path  = Path(download_dir) / "lgb_model.pkl"
+    return joblib.load(artifact_path)
+
+
+def get_model_predictions(model, features: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply your full sklearn pipeline to `features` and return a DataFrame
+    with columns ["pickup_location_id","predicted_demand"].
+    """
+    preds_array = model.predict(features)
+    out = pd.DataFrame({
+        "pickup_location_id": features["pickup_location_id"].values,
+        "predicted_demand":   preds_array.round(0).astype("int32")
+    })
+    return out
+
+
+# If you still want to be able to run `python -m src.inference` as a standalone,
+# you can leave your old main() here (it won’t be imported by pipelines/...)
+def main():
+    """
+    Legacy entrypoint.  
+    Reads the last timestamp from your hourly FG, builds features,
+    loads model, writes one hour of predictions back to FG.
+    """
+    fs = get_feature_store()
+
+    # 1) get latest hour
+    hg = fs.get_feature_group(name=config.FEATURE_GROUP_NAME, version=config.FEATURE_GROUP_VERSION)
+    hist = hg.read()
     latest_hr = pd.to_datetime(hist["pickup_hour"].max(), utc=True)
-    logger.info("Latest historical hour: %s", latest_hr)
 
-    # ────────────────────────────────────────────────────────────────────────────
-    # 3️⃣ Define your 28-day sliding window
-    # ────────────────────────────────────────────────────────────────────────────
-    window_size = 24 * 28  # hours
-    fetch_from  = latest_hr - timedelta(hours=window_size + 1)
-    fetch_to    = latest_hr
-    logger.info("Building features from %s → %s", fetch_from, fetch_to)
+    # 2) sliding window bounds
+    window_size  = 24 * 28
+    fetch_from   = latest_hr - pd.Timedelta(hours=window_size + 1)
+    fetch_to     = latest_hr
 
-    # ────────────────────────────────────────────────────────────────────────────
-    # 4️⃣ Pull exactly that slice from your Feature View
-    # ────────────────────────────────────────────────────────────────────────────
-    fv = fs.get_feature_view(
-        name    = config.FEATURE_VIEW_NAME,
-        version = config.FEATURE_VIEW_VERSION,
-    )
-    ts_data = (
+    # 3) fetch raw timeseries
+    fv = fs.get_feature_view(name=config.FEATURE_VIEW_NAME, version=config.FEATURE_VIEW_VERSION)
+    ts = (
         fv.get_batch_data(start_time=fetch_from, end_time=fetch_to)
           .loc[lambda df: df.pickup_hour.between(fetch_from, fetch_to)]
-          .sort_values(["pickup_location_id", "pickup_hour"])
+          .sort_values(["pickup_location_id","pickup_hour"])
     )
 
-    if ts_data.empty:
-        logger.warning("No time-series data in that window → exiting cleanly")
-        sys.exit(0)
+    # 4) build features
+    feats = transform_ts_data_info_features(ts, feature_col="rides", window_size=window_size, step_size=1)
+    feats["target"] = 0  # dummy for pipeline
 
-    # ────────────────────────────────────────────────────────────────────────────
-    # 5️⃣ Turn it into sliding-window features
-    # ────────────────────────────────────────────────────────────────────────────
-    features = transform_ts_data_info_features(
-        ts_data,
-        feature_col = "rides",
-        window_size = window_size,
-        step_size   = 1,
-    )
+    # 5) load & predict
+    pipeline = load_model_from_registry()
+    preds    = get_model_predictions(pipeline, feats)
+    preds    = preds.rename(columns={"predicted_demand": "predicted_rides"})
+    preds["pickup_hour"] = latest_hr + pd.Timedelta(hours=1)
 
-    if features.empty:
-        logger.warning("Not enough history to build even one window → exiting cleanly")
-        sys.exit(0)
-
-    # ────────────────────────────────────────────────────────────────────────────
-    # 6️⃣ Insert dummy target so your pipeline sees exactly the 676 inputs
-    # ────────────────────────────────────────────────────────────────────────────
-    features["target"] = 0
-
-    # ────────────────────────────────────────────────────────────────────────────
-    # 7️⃣ Load your full sklearn Pipeline (featurizer + LGBM) from model registry
-    # ────────────────────────────────────────────────────────────────────────────
-    model = load_model_from_registry()
-
-    # ────────────────────────────────────────────────────────────────────────────
-    # 8️⃣ Run prediction
-    # ────────────────────────────────────────────────────────────────────────────
-    preds = get_model_predictions(model, features)
-    # rename to match FG schema
-    preds = preds.rename(columns={"predicted_demand": "predicted_rides"})
-
-    # ────────────────────────────────────────────────────────────────────────────
-    # 9️⃣ Stamp on the next-hour timestamp
-    # ────────────────────────────────────────────────────────────────────────────
-    preds["pickup_hour"] = latest_hr + timedelta(hours=1)
-
-    # ────────────────────────────────────────────────────────────────────────────
-    # 🔟 Write back to your prediction FG v2
-    # ────────────────────────────────────────────────────────────────────────────
+    # 6) write back
+    from hsfs.feature import Feature
     pred_fg = fs.get_or_create_feature_group(
         name         = config.FEATURE_GROUP_MODEL_PREDICTION,
         version      = config.FEATURE_GROUP_MODEL_PREDICTION_VERSION,
-        description  = "Next-hour demand predictions from LGBM model",
-        primary_key  = ["pickup_location_id", "pickup_hour"],
+        description  = "Next-hour predictions",
+        primary_key  = ["pickup_location_id","pickup_hour"],
         event_time   = "pickup_hour",
         online_enabled=False,
         features     = [
-            Feature("pickup_location_id", "string"),
-            Feature("pickup_hour",        "timestamp"),
-            Feature("predicted_rides",    "int"),
-        ],
+            Feature("pickup_location_id","string"),
+            Feature("pickup_hour","timestamp"),
+            Feature("predicted_rides","int"),
+        ]
     )
-
-    # ensure correct types
     preds["pickup_location_id"] = preds["pickup_location_id"].astype(str)
     preds["predicted_rides"]    = preds["predicted_rides"].astype("int32")
-
-    logger.info("Inserting %d prediction rows …", len(preds))
     pred_fg.insert(preds, write_options={"wait_for_job": False})
-    logger.info("✅ Inference complete — predictions up to %s", preds["pickup_hour"].iloc[0])
+
+    print("✅ Done, predictions up to", preds["pickup_hour"].iloc[0])
+
 
 if __name__ == "__main__":
     main()
