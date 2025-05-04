@@ -180,3 +180,5 @@ pyrightconfig.json
 .env
 data/*
 models/*
+data_copy_1_month/*
+notebooks/data/*

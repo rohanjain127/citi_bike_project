@@ -113,6 +113,7 @@ def filter_citibike_data(df: pd.DataFrame, year: int, month: int) -> pd.DataFram
     # Define top 3 start station IDs (as strings for consistency)
     top_station_ids = {'6140.05', '6948.10', '5329.03'}
     df = df[df['start_station_id'].isin(top_station_ids)]
+    
 
     # Add year and month for traceability
     df['year'] = year
@@ -245,15 +246,58 @@ def fill_missing_rides_full_range(df, hour_col, location_col, rides_col):
     df_merged[rides_col] = df_merged[rides_col].fillna(0).astype(int)
     return df_merged
 
-# ----------------------------------------------------
-# 5. Transform raw data to time-series hourly format
-# ----------------------------------------------------
+TOP_STATIONS = {"6140.05", "6948.10", "5329.03"}
 
 def transform_raw_data_into_ts_data(rides: pd.DataFrame) -> pd.DataFrame:
-    rides["pickup_hour"] = rides["pickup_datetime"].dt.floor("h")
-    agg = rides.groupby(["pickup_hour", "pickup_location_id"]).size().reset_index(name="rides")
-    filled = fill_missing_rides_full_range(agg, "pickup_hour", "pickup_location_id", "rides")
-    return filled.sort_values(["pickup_location_id", "pickup_hour"]).reset_index(drop=True)
+    """
+    Aggregates raw rides into an hourly time series.
+    If the input already has 'pickup_location_id', we assume it's been filtered upstream.
+    Otherwise we filter and rename 'start_station_id' -> 'pickup_location_id'.
+    """
+
+    df = rides.copy()
+
+    # If upstream loader already gave us pickup_location_id, skip the filter & rename
+    if "pickup_location_id" not in df.columns:
+        # rename started_at → pickup_datetime if necessary
+        if "started_at" in df.columns and "pickup_datetime" not in df.columns:
+            df = df.rename(columns={"started_at": "pickup_datetime"})
+        # do the TOP_STATIONS filter & rename
+        df = df.dropna(subset=["pickup_datetime", "start_station_id"])
+        df["start_station_id"] = df["start_station_id"].astype(str)
+        df = df[df["start_station_id"].isin(TOP_STATIONS)].copy()
+        df = df.rename(columns={"start_station_id": "pickup_location_id"})
+    else:
+        # ensure the timestamp column is named correctly
+        if "started_at" in df.columns and "pickup_datetime" not in df.columns:
+            df = df.rename(columns={"started_at": "pickup_datetime"})
+
+    # Now we should have:
+    #   - df["pickup_datetime"] as datetime
+    #   - df["pickup_location_id"] as string
+
+    # Floor to the hour and aggregate
+    df["pickup_hour"] = pd.to_datetime(df["pickup_datetime"]).dt.floor("h")
+    agg = (
+        df.groupby(["pickup_hour", "pickup_location_id"])
+          .size()
+          .reset_index(name="rides")
+    )
+
+    # Fill missing hour×location combos
+    filled = fill_missing_rides_full_range(
+        agg, hour_col="pickup_hour",
+        location_col="pickup_location_id",
+        rides_col="rides",
+    )
+
+    return (
+        filled
+        .sort_values(["pickup_location_id","pickup_hour"])
+        .reset_index(drop=True)
+    )
+
+
 
 # -----------------------------------------------------------------------
 # 6. Create sliding window features and targets from time-series data
@@ -346,10 +390,17 @@ def fetch_batch_raw_data(from_date: Union[datetime, str], to_date: Union[datetim
 
     months = list(set([from_hist.month, to_hist.month]))
     data = load_and_process_citibike_data(from_hist.year, months=months)
+
+    # Rename started_at to pickup_datetime if needed
+    if "started_at" in data.columns and "pickup_datetime" not in data.columns:
+        data = data.rename(columns={"started_at": "pickup_datetime"})
+
     data = data[(data["pickup_datetime"] >= from_hist) & (data["pickup_datetime"] < to_hist)]
     data["pickup_datetime"] += timedelta(weeks=52)
 
     return data.sort_values(["pickup_location_id", "pickup_datetime"]).reset_index(drop=True)
+
+
 
 def transform_ts_data_info_features(
     df, feature_col="rides", window_size=12, step_size=1
@@ -428,23 +479,11 @@ import pandas as pd
 import zipfile
 
 
+
+
+TOP_STATIONS = {"6140.05", "6948.10", "5329.03"}  # already defined earlier
+
 def load_and_process_citibike_data_from_local(year: int, months: list, base_path: str = "data/citibike") -> pd.DataFrame:
-    """
-    Load Citi Bike data directly from locally extracted or zipped CSV files.
-
-    Supports files like:
-    - 202504-citibike-tripdata.csv
-    - 202504-citibike-tripdata.csv.zip
-    - 202504-citibike-tripdata.zip
-
-    Parameters:
-        year (int): The year of the data.
-        months (list of int): The months to load (e.g., [1, 2, 3]).
-        base_path (str): Base folder where CSVs or ZIPs are stored.
-
-    Returns:
-        pd.DataFrame: Concatenated and cleaned dataframe for the given months.
-    """
     all_months_data = []
     data_dir = Path(base_path)
 
@@ -466,22 +505,25 @@ def load_and_process_citibike_data_from_local(year: int, months: list, base_path
                         if inner_file.endswith(".csv"):
                             with zip_ref.open(inner_file) as f:
                                 df = pd.read_csv(f)
-                                df['source_file'] = file_path.name
-                                all_months_data.append(df)
             elif file_path.suffix == ".csv":
                 df = pd.read_csv(file_path)
-                df['source_file'] = file_path.name
-                all_months_data.append(df)
             elif file_path.suffixes[-2:] == [".csv", ".zip"]:
                 with zipfile.ZipFile(file_path, 'r') as zip_ref:
                     csv_name = zip_ref.namelist()[0]
                     with zip_ref.open(csv_name) as f:
                         df = pd.read_csv(f)
-                        df['source_file'] = file_path.name
-                        all_months_data.append(df)
+
+            # 🧹 Clean & Filter
+            df['started_at'] = pd.to_datetime(df['started_at'], errors='coerce')
+            df = df.dropna(subset=['started_at', 'start_station_id'])
+            df['start_station_id'] = df['start_station_id'].astype(str)
+
+            df = df[df["start_station_id"].isin(TOP_STATIONS)].copy()
+            df = df.rename(columns={"start_station_id": "pickup_location_id", "started_at": "pickup_datetime"})
+
+            df['source_file'] = file_path.name
+            all_months_data.append(df)
 
     df_all = pd.concat(all_months_data, ignore_index=True)
-    df_all['started_at'] = pd.to_datetime(df_all['started_at'], errors='coerce')
-    df_all['start_station_id'] = df_all['start_station_id'].astype(str)
-
     return df_all
+

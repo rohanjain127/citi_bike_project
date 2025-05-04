@@ -12,6 +12,8 @@ RAW_DATA_DIR = DATA_DIR / "raw"
 PROCESSED_DATA_DIR = DATA_DIR / "processed"
 TRANSFORMED_DATA_DIR = DATA_DIR / "transformed"
 MODELS_DIR = PARENT_DIR / "models"
+#LOCAL_CITIBIKE_DATA_PATH = Path("notebooks/data/citibike")
+LOCAL_CITIBIKE_DATA_PATH = PARENT_DIR / "notebooks" / "data" / "citibike"
 
 # Create directories if they don't exist
 for directory in [
@@ -38,3 +40,4 @@ MODEL_NAME = "taxi_demand_predictor_next_hour"
 MODEL_VERSION = 1
 
 FEATURE_GROUP_MODEL_PREDICTION = "taxi_hourly_model_prediction"
+FEATURE_GROUP_MODEL_PREDICTION_VERSION = 2    

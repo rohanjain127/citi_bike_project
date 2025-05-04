@@ -133,7 +133,7 @@ def fetch_hourly_rides(hours):
 
 
 def fetch_days_data(days):
-    current_date = pd.to_datetime(datetime.now(timezone.utc))
+    current_date = pd.Timestamp("2025-04-01 00:00:00", tz="UTC")
     fetch_data_from = current_date - timedelta(days=(365 + days))
     fetch_data_to = current_date - timedelta(days=365)
     print(fetch_data_from, fetch_data_to)

@@ -148,7 +148,7 @@ def create_taxi_map(shapefile_path, prediction_data):
         style_function=style_function,
         tooltip=folium.GeoJsonTooltip(
             fields=["zone", "predicted_demand"],
-            aliases=["Zone:", "Predicted Demand:"],
+            aliases=["Station ID:", "Predicted Demand:"],
             style=(
                 "background-color: white; color: #333333; font-family: arial; font-size: 12px; padding: 10px;"
             ),
@@ -230,8 +230,9 @@ def load_shape_data_file(
 
 # st.set_page_config(layout="wide")
 
-current_date = pd.Timestamp.now(tz="Etc/UTC")
-st.title(f"New York Yellow Taxi Cab Demand Next Hour")
+#current_date = pd.Timestamp.now(tz="Etc/UTC")
+current_date = pd.Timestamp("2025-04-01 00:00:00", tz="UTC")
+st.title(f"New York Citi Bike Ride Demand Next Hour")
 st.header(f'{current_date.strftime("%Y-%m-%d %H:%M:%S")}')
 
 progress_bar = st.sidebar.header("Working Progress")
