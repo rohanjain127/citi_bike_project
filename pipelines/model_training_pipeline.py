@@ -1,109 +1,107 @@
+# pipelines/model_training_pipeline.py
 #!/usr/bin/env python3
 """
-Model-training pipeline:
-▪ Fetch the last 180 days of rides from Hopsworks
-▪ Build sliding-window features & targets
-▪ Train (or skip) & register a new model if it outperforms the current one
+Retrain the next‑hour demand model on the latest data and push it to Hopsworks.
 """
 
-import logging
-import sys
-from pathlib import Path
-
+from datetime import timedelta
 import joblib
+import lightgbm as lgb
+import numpy as np
+import os
 import pandas as pd
-from sklearn.metrics import mean_absolute_error
-from hsml.model_schema import ModelSchema
-from hsml.schema import Schema
+from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.pipeline import Pipeline
+from hsfs.feature import Feature
 
 import src.config as config
-from src.data_utils import transform_ts_data_info_features_and_target
-from src.inference import fetch_days_data, get_hopsworks_project, load_metrics_from_registry
-from src.pipeline_utils import get_pipeline
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Logging
-# ────────────────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)s  %(message)s",
+from src.data_utils import (
+    transform_ts_data_info_features_and_target_loop,
 )
-logger = logging.getLogger(__name__)
+from src.inference import (
+    get_feature_store,          # already defined
+    get_hopsworks_project,      # already defined
+)
 
-def main():
-    # ────────────────────────────────────────────────────────────────────────────
-    # 1️⃣ Fetch historical data (past 180 days)
-    # ────────────────────────────────────────────────────────────────────────────
-    logger.info("Fetching last 180 days of rides …")
-    ts_data = fetch_days_data(180)
+WINDOW_SIZE = 24 * 28      # 672 lags (4 weeks)
+STEP_SIZE   = 1            # slide by 1 hour
 
-    if ts_data.empty:
-        logger.warning("No data returned for past 180 days → skipping training")
-        sys.exit(0)
+def main() -> None:
+    # ── 1️⃣  Connect to Hopsworks & grab the Feature Store
+    fs = get_feature_store()
 
-    # ────────────────────────────────────────────────────────────────────────────
-    # 2️⃣ Build features & targets via sliding window
-    # ────────────────────────────────────────────────────────────────────────────
-    window_size = 24 * 28
-    step_size   = 23  # one-step ahead
-    logger.info("Transforming into sliding-window features …")
-    features, targets = transform_ts_data_info_features_and_target(
-        ts_data, feature_col="rides", window_size=window_size, step_size=step_size
+    # ── 2️⃣  Download *all* historical rows from the hourly FG
+    hourly_fg = fs.get_feature_group(
+        name    = config.FEATURE_GROUP_NAME,
+        version = config.FEATURE_GROUP_VERSION,
+    )
+    ts_data = hourly_fg.read()
+    ts_data.sort_values(["pickup_location_id", "pickup_hour"], inplace=True)
+
+    # ── 3️⃣  Build sliding‑window features **and** target in one go
+    X, y = transform_ts_data_info_features_and_target_loop(
+        ts_data,
+        feature_col = "rides",
+        window_size = WINDOW_SIZE,
+        step_size   = STEP_SIZE,
     )
 
-    if len(features) == 0:
-        logger.warning("Not enough data to build any training windows → skipping training")
-        sys.exit(0)
+    # dummy “target” column gets dropped inside the pipeline,
+    # but we still want it present for consistency
+    X["target"] = y
 
-    # ────────────────────────────────────────────────────────────────────────────
-    # 3️⃣ Train a new pipeline
-    # ────────────────────────────────────────────────────────────────────────────
-    pipeline = get_pipeline()
-    logger.info("Training pipeline on %d samples …", len(features))
-    pipeline.fit(features, targets)
+    # ── 4️⃣  Train / fine‑tune LightGBM
+    lgb_params = dict(
+        learning_rate = 0.05,
+        n_estimators  = 600,
+        num_leaves    = 128,
+    )
+    lgbm = lgb.LGBMRegressor(**lgb_params)
 
-    # ────────────────────────────────────────────────────────────────────────────
-    # 4️⃣ Evaluate on the same data (or hold-out if you prefer)
-    # ────────────────────────────────────────────────────────────────────────────
-    preds = pipeline.predict(features)
-    test_mae = mean_absolute_error(targets, preds)
-    logger.info("New model MAE: %.4f", test_mae)
+    # Any extra preprocessing (hour‑of‑day, etc.) already lives
+    # in your old pipeline – let’s re‑use its `ColumnTransformer`
+    old_pipe_path = os.path.join("models", "lgb_model.pkl")
+    old_pipe      = joblib.load(old_pipe_path)
+    preproc       = old_pipe.steps[0][1]          # first step is the transformer
 
-    # ────────────────────────────────────────────────────────────────────────────
-    # 5️⃣ Compare to current registered metric
-    # ────────────────────────────────────────────────────────────────────────────
-    metric = load_metrics_from_registry()
-    current_mae = metric.get("test_mae", float("inf"))
-    logger.info("Current registered MAE: %.4f", current_mae)
+    pipe = Pipeline(
+        steps=[
+            ("featurizer", preproc),
+            ("model",      lgbm),
+        ]
+    )
 
-    if test_mae >= current_mae:
-        logger.info("New model is not better → skipping registration")
-        sys.exit(0)
+    pipe.fit(X, y)
 
-    # ────────────────────────────────────────────────────────────────────────────
-    # 6️⃣ Register new model
-    # ────────────────────────────────────────────────────────────────────────────
-    logger.info("New model improves MAE → registering version …")
-    model_path = Path(config.MODELS_DIR) / "lgb_model.pkl"
-    joblib.dump(pipeline, model_path)
+    # ── 5️⃣  Evaluate on a *hold‑out* slice (last 7 days)
+    cutoff  = ts_data["pickup_hour"].max() - timedelta(days=7)
+    X_train = X[X["pickup_hour"] < cutoff]
+    y_train = y[X["pickup_hour"] < cutoff]
+    X_test  = X[X["pickup_hour"] >= cutoff]
+    y_test  = y[X["pickup_hour"] >= cutoff]
 
-    # infer schemas
-    input_schema  = Schema(features)
-    output_schema = Schema(targets)
-    model_schema  = ModelSchema(input_schema=input_schema, output_schema=output_schema)
+    pipe.fit(X_train, y_train)
+    preds = pipe.predict(X_test)
+    mae   = mean_absolute_error(y_test, preds)
+    r2    = r2_score(y_test, preds)
 
+    print(f"📝  MAE={mae:,.2f} | R²={r2:0.4f} on last 7 days hold‑out")
+
+    # ── 6️⃣  Register the new model version in Hopsworks
     project = get_hopsworks_project()
-    registry = project.get_model_registry()
+    mr      = project.get_model_registry()
 
-    model = registry.sklearn.create_model(
-        name           = config.MODEL_NAME,
-        metrics        = {"test_mae": test_mae},
-        input_example  = features.sample(n=1),
-        model_schema   = model_schema,
+    model_meta = mr.python.create_model(
+        name        = config.MODEL_NAME,
+        model_dir   = "tmp_new_model",
+        version     = None,      # auto‑increment
+        metrics     = {"mae": mae, "r2": r2},
+        description = "Retrained LightGBM with data up to "
+                      f"{ts_data['pickup_hour'].max().strftime('%Y‑%m‑%d')}",
     )
-    model.save(model_path)
+    model_meta.save(pipe)
 
-    logger.info("✅ Registered new model version with MAE %.4f", test_mae)
+    print(f"✅  Registered model «{model_meta.name}» v{model_meta.version}")
 
 if __name__ == "__main__":
     main()
