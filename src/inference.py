@@ -19,6 +19,39 @@ import src.config as config
 from src.data_utils import transform_ts_data_info_features
 
 
+
+# ─── NEW helper: fetch the last N days of hourly ride data ─────────────
+import pandas as pd
+from datetime import timedelta
+
+def fetch_days_data(days: int = 28) -> pd.DataFrame:
+    """
+    Pull the most‑recent <days> of hourly ride data from the Feature View.
+
+    Returns
+    -------
+    pd.DataFrame with columns  [pickup_hour, pickup_location_id, rides]
+    """
+    fs = get_feature_store()                       # <- already defined below
+    fv = fs.get_feature_view(
+        name    = config.FEATURE_VIEW_NAME,
+        version = config.FEATURE_VIEW_VERSION,
+    )
+
+    end_ts   = pd.Timestamp.utcnow().floor("h")
+    start_ts = end_ts - timedelta(days=days)
+
+    ts = (
+        fv.get_batch_data(start_time=start_ts, end_time=end_ts)
+          .loc[lambda df: df.pickup_hour.between(start_ts, end_ts)]
+          .sort_values(["pickup_location_id", "pickup_hour"])
+          .reset_index(drop=True)
+    )
+    return ts
+# ───────────────────────────────────────────────────────────────────────
+
+
+
 def get_hopsworks_project() -> hopsworks.project.Project:
     """Log in to Hopsworks and return the project handle."""
     return hopsworks.login(
